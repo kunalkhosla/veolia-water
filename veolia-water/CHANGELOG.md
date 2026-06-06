@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.2
+
+- Robust navigation: drop `networkidle` (the portal's analytics/New Relic sockets
+  never go idle) in favor of `domcontentloaded`, and retry transient container
+  network errors (`ERR_NETWORK_CHANGED` etc.) instead of failing the run.
+- On a failed run, retry up to 3× and then re-attempt in ≤1h rather than sleeping
+  the full 24h interval.
+- Chromium launched with background-networking/sync/translate disabled.
+
 ## 0.1.1
 
 - Fix add-on build: hardcode the Debian/glibc base image (`python:3.12-slim-bookworm`)

@@ -115,6 +115,39 @@ def click_first(page, selectors, what, required=True):
     return True
 
 
+TRANSIENT_NAV = ("ERR_NETWORK_CHANGED", "ERR_NETWORK_IO_SUSPENDED",
+                 "ERR_CONNECTION_RESET", "ERR_TIMED_OUT", "Timeout")
+
+
+def goto(page, url, attempts=4):
+    """Navigate with retries on transient container-network errors.
+
+    Uses domcontentloaded (not networkidle): the portal keeps analytics/New
+    Relic sockets open, so networkidle waits needlessly and is fragile to blips.
+    """
+    last = None
+    for i in range(1, attempts + 1):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            return
+        except PWTimeout as e:
+            last = e
+        except Exception as e:
+            last = e
+            if not any(t in str(e) for t in TRANSIENT_NAV):
+                raise
+        log.warning("goto %s failed (attempt %d/%d): %s", url, i, attempts, last)
+        time.sleep(5)
+    raise last
+
+
+def settle(page):
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=30000)
+    except Exception:
+        pass
+
+
 def dump_page(page, label):
     try:
         txt = page.inner_text("body")[:1500]
@@ -197,7 +230,7 @@ def is_logged_in(page) -> bool:
 
 def login(page, opts):
     log.info("session invalid -> logging in")
-    page.goto(f"{PORTAL}/user/login", wait_until="networkidle")
+    goto(page, f"{PORTAL}/user/login")
     fill_first(page,
                ['input[type="email"]', 'input[name="name"]', '#edit-name',
                 'input[name="mail"]'],
@@ -210,7 +243,7 @@ def login(page, opts):
                 ['#edit-submit', 'button[type="submit"]', 'input[type="submit"]',
                  'button:has-text("Sign In")', 'text=Sign In'],
                 "sign in")
-    page.wait_for_load_state("networkidle")
+    settle(page)
 
     # OTP delivery-method step (choose EMAIL), if present
     if _looks_like_mfa(page):
@@ -226,7 +259,7 @@ def login(page, opts):
                     ['button:has-text("Send")', 'button:has-text("Continue")',
                      '#edit-submit', 'button[type="submit"]', 'input[type="submit"]'],
                     "send code", required=False)
-        page.wait_for_load_state("networkidle")
+        settle(page)
 
         code = fetch_otp(opts, otp_requested_at)
         fill_first(page,
@@ -237,7 +270,7 @@ def login(page, opts):
                     ['button:has-text("Verify")', 'button:has-text("Submit")',
                      '#edit-submit', 'button[type="submit"]', 'input[type="submit"]'],
                     "verify code", required=False)
-        page.wait_for_load_state("networkidle")
+        settle(page)
 
     if not is_logged_in(page):
         dump_page(page, "login-failed")
@@ -400,8 +433,11 @@ def run_once(opts):
     require(opts, "veolia_username", "veolia_password", "account_number",
             "gmail_username", "gmail_app_password")
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True,
-                                    args=["--no-sandbox", "--disable-dev-shm-usage"])
+        browser = p.chromium.launch(headless=True, args=[
+            "--no-sandbox", "--disable-dev-shm-usage",
+            "--disable-background-networking", "--disable-sync",
+            "--disable-features=Translate,OptimizationHints",
+        ])
         ctx_kw = {"user_agent": UA, "locale": "en-US"}
         if os.path.exists(STATE_PATH):
             ctx_kw["storage_state"] = STATE_PATH
@@ -409,12 +445,10 @@ def run_once(opts):
         page = ctx.new_page()
         page.set_default_timeout(45000)
         try:
-            page.goto(f"{PORTAL}/water-usage/{opts['account_number']}",
-                      wait_until="networkidle")
+            goto(page, f"{PORTAL}/water-usage/{opts['account_number']}")
             if not is_logged_in(page):
                 login(page, opts)
-                page.goto(f"{PORTAL}/water-usage/{opts['account_number']}",
-                          wait_until="networkidle")
+                goto(page, f"{PORTAL}/water-usage/{opts['account_number']}")
             ctx.storage_state(path=STATE_PATH)  # persist refreshed session
 
             csv_text = fetch_daily_csv(page, opts)
@@ -452,12 +486,19 @@ def main():
         time.sleep(interval)
 
     while True:
-        try:
-            run_once(opts)
-        except Exception as e:
-            log.exception("run failed: %s", e)
-        log.info("sleeping %.1fh until next run", interval / 3600)
-        time.sleep(interval)
+        ok = False
+        for attempt in range(1, 4):
+            try:
+                run_once(opts)
+                ok = True
+                break
+            except Exception as e:
+                log.exception("run failed (attempt %d/3): %s", attempt, e)
+                if attempt < 3:
+                    time.sleep(60)
+        nap = interval if ok else min(3600, interval)  # retry sooner on failure
+        log.info("sleeping %.1fh until next run", nap / 3600)
+        time.sleep(nap)
         opts = load_options()  # pick up config changes between runs
 
 
