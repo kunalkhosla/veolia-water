@@ -1,0 +1,8 @@
+# local secrets / runtime state — never commit
+config.env
+*.env
+state.json
+__pycache__/
+*.pyc
+.venv/
+.DS_Store

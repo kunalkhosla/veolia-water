@@ -1,0 +1,35 @@
+name: Veolia Water → HA
+version: "0.1.0"
+slug: veolia_water
+description: Scrapes Veolia (ex-SUEZ) NJ water usage and imports it into HA statistics.
+url: https://github.com/kunalkhosla/veolia-water
+arch:
+  - amd64
+init: false
+startup: application
+boot: auto
+homeassistant_api: true
+hassio_api: false
+host_network: false
+options:
+  veolia_username: ""
+  veolia_password: ""
+  gmail_username: ""
+  gmail_app_password: ""
+  account_number: ""
+  days_back: 45
+  run_interval_hours: 24
+  run_on_start: true
+  dry_run: false
+  log_level: info
+schema:
+  veolia_username: str
+  veolia_password: password
+  gmail_username: str
+  gmail_app_password: password
+  account_number: str
+  days_back: int(1,400)
+  run_interval_hours: int(1,168)
+  run_on_start: bool
+  dry_run: bool
+  log_level: list(debug|info|warning|error)

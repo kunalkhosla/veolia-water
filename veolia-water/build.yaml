@@ -1,0 +1,4 @@
+build_from:
+  amd64: python:3.12-slim-bookworm
+labels:
+  org.opencontainers.image.source: https://github.com/kunalkhosla/veolia-water
