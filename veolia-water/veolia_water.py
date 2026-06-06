@@ -183,6 +183,27 @@ def settle(page):
         pass
 
 
+def dismiss_cookie_banner(page):
+    """The EU cookie-compliance banner overlays the page and intercepts clicks.
+    Decline non-essential (privacy-preserving), then hard-remove it so it can't
+    block form clicks. Clicking 'Dismiss all' sets a cookie so it stays gone."""
+    btn = _first_visible(page, [
+        'button:has-text("Dismiss all")', '.eu-cookie-compliance-dismiss-button',
+        'button:has-text("Decline")', 'button:has-text("Necessary")',
+        'button:has-text("Reject")'])
+    if btn:
+        try:
+            btn.click(timeout=5000)
+            log.info("dismissed cookie banner")
+        except Exception:
+            pass
+    try:
+        page.evaluate("() => { const e = document.querySelector('#sliding-popup');"
+                      " if (e) e.remove(); }")
+    except Exception:
+        pass
+
+
 def dump_page(page, label):
     try:
         txt = page.inner_text("body")[:1500]
@@ -299,6 +320,7 @@ def login(page, opts):
         dump_page(page, "no-login-form")
         raise RuntimeError("login form never appeared (Cloudflare not cleared?)")
 
+    dismiss_cookie_banner(page)
     fill_first(page, ['input[name="name"]', 'input[type="email"]', '#edit-name',
                       'input[name="mail"]'], opts["veolia_username"], "email")
     fill_first(page, ['input[name="pass"]', 'input[type="password"]', '#edit-pass'],
@@ -312,6 +334,7 @@ def login(page, opts):
     log.info("post-submit state: %s", state)
     if state == "mfa":
         log.info("MFA step: choosing email delivery")
+        dismiss_cookie_banner(page)
         click_first(page, ['input[type="radio"][value*="email" i]',
                            'label:has-text("Email")', 'button:has-text("Email")',
                            'text=/email/i'], "email delivery option", required=False)

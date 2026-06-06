@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.3
+
+- Dismiss the EU cookie-consent banner (privacy-preserving / decline) before
+  interacting with the login form — on a fresh profile it overlaid the form and
+  intercepted the Sign In click, timing out login.
+
 ## 0.2.2
 
 - Replace `xvfb-run` with a manual `Xvfb :99` start (via run.sh) + `DISPLAY=:99`,
