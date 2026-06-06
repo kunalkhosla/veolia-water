@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1
+
+- Fix: install `xauth` alongside `xvfb` (xvfb-run needs it; without it the add-on
+  crash-looped with "xauth command not found").
+
 ## 0.2.0
 
 - **Cloudflare bypass:** switch from Playwright to **patchright** and run a
