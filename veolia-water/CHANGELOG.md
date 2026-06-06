@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.2
+
+- Replace `xvfb-run` with a manual `Xvfb :99` start (via run.sh) + `DISPLAY=:99`,
+  removing the `xauth` dependency that crash-looped the add-on.
+
 ## 0.2.1
 
 - Fix: install `xauth` alongside `xvfb` (xvfb-run needs it; without it the add-on
