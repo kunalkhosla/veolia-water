@@ -1,5 +1,7 @@
-ARG BUILD_FROM
-FROM ${BUILD_FROM}
+# Hardcoded Debian/glibc base (NOT the HA Alpine base): Alpine/musl has no pip
+# here and can't run Playwright's Chromium. Supervisor builds this Dockerfile
+# directly for a local add-on, so BUILD_FROM indirection isn't needed.
+FROM python:3.12-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
