@@ -21,17 +21,20 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from email import message_from_bytes
 from email.utils import parsedate_to_datetime
+import urllib.request
 from zoneinfo import ZoneInfo
 
-from playwright.sync_api import TimeoutError as PWTimeout
-from playwright.sync_api import sync_playwright
+# patchright is a stealth-patched drop-in for Playwright; plain Playwright (even
+# real Chrome) gets fingerprinted and stuck on the portal's Cloudflare Turnstile.
+from patchright.sync_api import TimeoutError as PWTimeout
+from patchright.sync_api import sync_playwright
 import websocket  # websocket-client
 
 PORTAL = "https://mywater.veolia.us"
-DATA_DIR = "/data"
+DATA_DIR = os.environ.get("VEOLIA_DATA_DIR", "/data")  # override for local testing
 OPTIONS_PATH = os.path.join(DATA_DIR, "options.json")
 STATE_PATH = os.path.join(DATA_DIR, "state.json")
 
@@ -39,7 +42,14 @@ STAT_ID = "veolia:water_consumption"
 STAT_SOURCE = "veolia"
 STAT_NAME = "Veolia Water Consumption"
 UNIT = "gal"
+STAT_COST_ID = "veolia:water_cost"
+STAT_COST_NAME = "Veolia Water Cost"
+COST_UNIT = "USD"
 TZ = ZoneInfo("America/New_York")  # portal renders usage in service-area local time
+
+# Headless does not pass Cloudflare Turnstile; run headed (under Xvfb in the
+# add-on). Override only for experiments.
+HEADLESS = os.environ.get("HEADLESS", "false").strip().lower() in ("1", "true", "yes")
 
 IMAP_HOST = "imap.gmail.com"
 OTP_FROM_HINTS = ("veolia", "mywater", "suez")
@@ -73,6 +83,15 @@ def load_options() -> dict:
     opts.setdefault("dry_run", False)
     opts.setdefault("log_level", "info")
     opts.setdefault("gmail_username", opts.get("veolia_username", ""))
+
+    def _bool(s):
+        return str(s).strip().lower() in ("1", "true", "yes", "on")
+    for key, cast in (("days_back", int), ("run_interval_hours", int),
+                      ("run_on_start", _bool), ("dry_run", _bool),
+                      ("log_level", str)):
+        v = os.environ.get(key.upper())
+        if v is not None:
+            opts[key] = cast(v)
     return opts
 
 
@@ -129,6 +148,7 @@ def goto(page, url, attempts=4):
     for i in range(1, attempts + 1):
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            wait_cf_clear(page)
             return
         except PWTimeout as e:
             last = e
@@ -139,6 +159,21 @@ def goto(page, url, attempts=4):
         log.warning("goto %s failed (attempt %d/%d): %s", url, i, attempts, last)
         time.sleep(5)
     raise last
+
+
+def wait_cf_clear(page, timeout=45):
+    """Wait for the Cloudflare Turnstile interstitial ('Just a moment...') to
+    auto-clear. patchright + a headed/persistent browser passes it in ~5-10s."""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            if "just a moment" not in (page.title() or "").lower():
+                return True
+        except Exception:
+            pass
+        time.sleep(2)
+    log.warning("Cloudflare challenge did not clear within %ss", timeout)
+    return False
 
 
 def settle(page):
@@ -154,6 +189,12 @@ def dump_page(page, label):
     except Exception:
         txt = "<no body>"
     log.info("[%s] url=%s\n----- page text -----\n%s\n---------------------", label, page.url, txt)
+    try:
+        path = os.path.join(DATA_DIR, f"debug-{label}.png")
+        page.screenshot(path=path, full_page=True)
+        log.info("saved screenshot %s", path)
+    except Exception as e:
+        log.debug("screenshot failed: %s", e)
 
 
 # --------------------------------------------------------------------------- #
@@ -225,57 +266,79 @@ def _msg_text(msg):
 # login
 # --------------------------------------------------------------------------- #
 def is_logged_in(page) -> bool:
-    return "/user/login" not in page.url
+    """Authenticated pages carry a logout link; the anonymous 'page has moved /
+    Sign In' page and the login form do not. (uid in drupalSettings proved
+    unreliable on this site.)"""
+    try:
+        if page.locator('a[href*="/user/logout"], a[href*="logout"]').count() > 0:
+            return True
+    except Exception:
+        pass
+    try:
+        uid = page.evaluate(
+            "() => (window.drupalSettings && window.drupalSettings.user "
+            "&& window.drupalSettings.user.uid) || 0")
+        return int(uid) > 0
+    except Exception:
+        return False
+
+
+OTP_DETECT_SELS = ['input[autocomplete="one-time-code"]', 'input[name*="code" i]',
+                   'input[name*="otp" i]', 'input[id*="code" i]', 'input[type="tel"]']
+OTP_FILL_SELS = OTP_DETECT_SELS + ['input[type="text"]']
 
 
 def login(page, opts):
     log.info("session invalid -> logging in")
     goto(page, f"{PORTAL}/user/login")
-    fill_first(page,
-               ['input[type="email"]', 'input[name="name"]', '#edit-name',
-                'input[name="mail"]'],
-               opts["veolia_username"], "email")
-    fill_first(page,
-               ['input[type="password"]', 'input[name="pass"]', '#edit-pass'],
+    # the form isn't instantly present after Cloudflare clears — wait for it
+    try:
+        page.wait_for_selector('input[name="name"], input[type="email"], #edit-name',
+                               state="visible", timeout=45000)
+    except PWTimeout:
+        dump_page(page, "no-login-form")
+        raise RuntimeError("login form never appeared (Cloudflare not cleared?)")
+
+    fill_first(page, ['input[name="name"]', 'input[type="email"]', '#edit-name',
+                      'input[name="mail"]'], opts["veolia_username"], "email")
+    fill_first(page, ['input[name="pass"]', 'input[type="password"]', '#edit-pass'],
                opts["veolia_password"], "password")
-    otp_requested_at = datetime.now(timezone.utc)
-    click_first(page,
-                ['#edit-submit', 'button[type="submit"]', 'input[type="submit"]',
-                 'button:has-text("Sign In")', 'text=Sign In'],
-                "sign in")
-    settle(page)
+    click_first(page, ['#edit-submit', 'button[type="submit"]', 'input[type="submit"]',
+                       'button:has-text("Sign In")', 'text=Sign In'], "sign in")
 
-    # OTP delivery-method step (choose EMAIL), if present
-    if _looks_like_mfa(page):
-        log.info("MFA step detected; choosing email delivery")
-        # pick the "email" option (radio/button/label), then continue/send
-        click_first(page,
-                    ['input[type="radio"][value*="email" i]',
-                     'label:has-text("Email")', 'button:has-text("Email")',
-                     'text=/email/i'],
-                    "email delivery option", required=False)
+    # After submit we either land logged-in (risk-based MFA may be skipped) or
+    # hit an MFA/OTP step. Poll instead of guessing with a fixed delay.
+    state = _wait_post_submit(page, timeout=35)
+    log.info("post-submit state: %s", state)
+    if state == "mfa":
+        log.info("MFA step: choosing email delivery")
+        click_first(page, ['input[type="radio"][value*="email" i]',
+                           'label:has-text("Email")', 'button:has-text("Email")',
+                           'text=/email/i'], "email delivery option", required=False)
         otp_requested_at = datetime.now(timezone.utc)
-        click_first(page,
-                    ['button:has-text("Send")', 'button:has-text("Continue")',
-                     '#edit-submit', 'button[type="submit"]', 'input[type="submit"]'],
+        click_first(page, ['button:has-text("Send")', 'button:has-text("Continue")',
+                           '#edit-submit', 'button[type="submit"]', 'input[type="submit"]'],
                     "send code", required=False)
-        settle(page)
-
+        try:
+            page.wait_for_selector(", ".join(OTP_DETECT_SELS), state="visible", timeout=30000)
+        except PWTimeout:
+            pass
         code = fetch_otp(opts, otp_requested_at)
-        fill_first(page,
-                   ['input[autocomplete="one-time-code"]', 'input[name*="code" i]',
-                    'input[name*="otp" i]', 'input[type="tel"]', 'input[type="text"]'],
-                   code, "otp code")
-        click_first(page,
-                    ['button:has-text("Verify")', 'button:has-text("Submit")',
-                     '#edit-submit', 'button[type="submit"]', 'input[type="submit"]'],
+        fill_first(page, OTP_FILL_SELS, code, "otp code")
+        click_first(page, ['button:has-text("Verify")', 'button:has-text("Submit")',
+                           '#edit-submit', 'button[type="submit"]', 'input[type="submit"]'],
                     "verify code", required=False)
-        settle(page)
 
-    if not is_logged_in(page):
+    # Post-login / post-OTP the portal can spin for many seconds — wait for the
+    # authenticated state to actually appear rather than closing mid-load.
+    if not wait_logged_in(page, timeout=75):
         dump_page(page, "login-failed")
-        raise RuntimeError("login did not complete (still on login page)")
+        raise RuntimeError("login did not complete")
     log.info("login OK")
+
+
+def _has_otp_input(page):
+    return _first_visible(page, OTP_DETECT_SELS) is not None
 
 
 def _looks_like_mfa(page):
@@ -288,25 +351,98 @@ def _looks_like_mfa(page):
                 "two-step", "passcode", "we sent", "choose how"))
 
 
+def _wait_post_submit(page, timeout=35):
+    """After credential submit: 'in' (logged in), 'mfa' (OTP step), or 'timeout'."""
+    end = time.time() + timeout
+    while time.time() < end:
+        if is_logged_in(page):
+            return "in"
+        if _has_otp_input(page) or _looks_like_mfa(page):
+            return "mfa"
+        time.sleep(1.5)
+    return "timeout"
+
+
+def wait_logged_in(page, timeout=75):
+    end = time.time() + timeout
+    while time.time() < end:
+        if is_logged_in(page):
+            return True
+        time.sleep(2)
+    return False
+
+
 # --------------------------------------------------------------------------- #
 # data
 # --------------------------------------------------------------------------- #
-def fetch_daily_csv(page, opts):
-    end = datetime.now(TZ).date()
-    start = end - timedelta(days=int(opts["days_back"]))
-    url = (f"/cp-vna-suez-water-usage/data/{start.isoformat()}/"
-           f"{end.isoformat()}/DAILY/csv")
-    log.info("fetching usage CSV: %s", url)
-    text = page.evaluate(
-        """async (u) => { const r = await fetch(u); return await r.text(); }""", url)
-    if not text or "<html" in text[:200].lower():
-        dump_page(page, "csv-unexpected")
-        raise RuntimeError("CSV fetch returned non-CSV (session lost?)")
-    return text
+BILL_RE_BAL = re.compile(r"Balance Due:\s*\$([\d,]+\.\d{2})", re.I)
+BILL_RE_DUE = re.compile(r"Due Date:\s*([A-Za-z]{3,9}\s+\d{1,2},\s*\d{4})", re.I)
+BILL_RE_STMT = re.compile(
+    r"(\d{2}/\d{2}/\d{2})\s+(\d{2}/\d{2}/\d{2})\s*-\s*(\d{2}/\d{2}/\d{2})\s+\$([\d,]+\.\d{2})")
 
 
-def parse_csv(text):
-    """Return [(date(YYYY-MM-DD), gallons float)] aggregated per day."""
+def _usdate(s):       # "06/02/26" -> "2026-06-02"
+    return datetime.strptime(s, "%m/%d/%y").date().isoformat()
+
+
+def _duedate(s):      # "Jun 17, 2026" -> "2026-06-17"
+    for f in ("%b %d, %Y", "%B %d, %Y"):
+        try:
+            return datetime.strptime(s.strip(), f).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def scrape_account(page):
+    """Parse the (already-loaded) account-summary page for billing info +
+    statement history. The latest statement's service dates also give us a
+    guaranteed-valid window for the usage CSV endpoint."""
+    body = page.inner_text("body")
+    bal = BILL_RE_BAL.search(body)
+    due = BILL_RE_DUE.search(body)
+    stmts = []
+    for bd, ss, se, amt in BILL_RE_STMT.findall(body):
+        stmts.append({"bill_date": _usdate(bd), "service_start": _usdate(ss),
+                      "service_end": _usdate(se),
+                      "amount": float(amt.replace(",", ""))})
+    acct = {
+        "balance_due": float(bal.group(1).replace(",", "")) if bal else None,
+        "due_date": _duedate(due.group(1)) if due else None,
+        "statements": stmts,
+    }
+    log.info("billing: balance=%s due=%s statements=%d",
+             acct["balance_due"], acct["due_date"], len(stmts))
+    return acct
+
+
+def fetch_usage_csv(page, window, granularity="HOURLY"):
+    """window = (service_start ISO, service_end ISO). The CSV endpoint serves
+    HTML for ranges outside available data, so we anchor to the real service
+    start and prefer through-today (open period), falling back to the bill end.
+    HOURLY is the finest resolution the portal exposes."""
+    today = datetime.now(TZ).date()
+    start = date.fromisoformat(window[0])
+    bill_end = date.fromisoformat(window[1])
+    for end in (today, bill_end):
+        if end < start:
+            continue
+        url = (f"/cp-vna-suez-water-usage/data/{start.isoformat()}/"
+               f"{end.isoformat()}/{granularity}/csv")
+        log.info("fetching usage CSV: %s", url)
+        text = page.evaluate(
+            "async (u) => { const r = await fetch(u); return await r.text(); }", url)
+        if text and text.lstrip().lower().startswith("meter"):
+            return text
+        log.warning("range %s..%s non-CSV (%d bytes)", start, end, len(text or ""))
+    dump_page(page, "csv-unexpected")
+    raise RuntimeError("CSV fetch returned non-CSV for all candidate ranges")
+
+
+def parse_rows(text):
+    """Parse the usage CSV into [(naive local datetime, gallons)] per interval,
+    ascending. Columns: Meter,Start Date,End Date,Water Consumption Gallons,Data Flag.
+    For HOURLY the Start Date carries the hour; we keep full resolution."""
     rows = list(csv.reader(io.StringIO(text)))
     rows = [r for r in rows if any(c.strip() for c in r)]
     if not rows:
@@ -314,37 +450,40 @@ def parse_csv(text):
     header = [c.strip().lower() for c in rows[0]]
     log.info("CSV header: %s (%d data rows)", header, len(rows) - 1)
 
-    def find(cands):
+    def find(cands, default):
         for i, h in enumerate(header):
             if any(c in h for c in cands):
                 return i
-        return None
+        return default
 
-    di = find(("date", "time", "day", "read"))
-    vi = find(("gallon", "usage", "consum", "volume", "ccf"))
-    if di is None or vi is None:
-        # fall back to positional: first col date, last numeric col value
-        di = 0 if di is None else di
-        vi = len(header) - 1 if vi is None else vi
-        log.warning("falling back to columns date=%d value=%d", di, vi)
+    di = find(("start date", "date", "time", "read"), 1)
+    vi = find(("gallon", "consum", "usage", "volume"), 3)
 
-    agg = {}
+    out = []
     for r in rows[1:]:
         if max(di, vi) >= len(r):
             continue
-        d = _parse_date(r[di].strip())
+        dt = _parse_dt(r[di].strip())
         v = _parse_float(r[vi])
-        if d is None or v is None:
+        if dt is None or v is None:
             continue
-        agg[d] = agg.get(d, 0.0) + v
+        out.append((dt, v))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def aggregate_daily(rows):
+    agg = {}
+    for dt, v in rows:
+        agg[dt.date().isoformat()] = agg.get(dt.date().isoformat(), 0.0) + v
     return sorted(agg.items())
 
 
-def _parse_date(s):
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%Y-%m-%dT%H:%M:%S",
-                "%m/%d/%Y %H:%M", "%b %d, %Y"):
+def _parse_dt(s):
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d",
+                "%m/%d/%Y %H:%M", "%m/%d/%Y", "%m/%d/%y", "%b %d, %Y"):
         try:
-            return datetime.strptime(s, fmt).date().isoformat()
+            return datetime.strptime(s, fmt)
         except ValueError:
             continue
     return None
@@ -388,42 +527,113 @@ def ha_call(ws, msg):
             return r
 
 
-def last_sum_before(ws, start_iso):
+def last_sum_before(ws, stat_id, start_iso):
     r = ha_call(ws, {
         "type": "recorder/statistics_during_period",
         "start_time": (datetime.fromisoformat(start_iso)
-                       - timedelta(days=400)).isoformat(),
+                       - timedelta(days=800)).isoformat(),
         "end_time": start_iso,
-        "statistic_ids": [STAT_ID],
+        "statistic_ids": [stat_id],
         "period": "day",
     })
-    pts = (r.get("result") or {}).get(STAT_ID) or []
+    pts = (r.get("result") or {}).get(stat_id) or []
     return pts[-1].get("sum", 0.0) if pts else 0.0
 
 
-def import_stats(ws, daily):
-    """daily = [(YYYY-MM-DD, gallons)] ascending."""
-    first_start = datetime.fromisoformat(daily[0][0]).replace(tzinfo=TZ).isoformat()
-    baseline = last_sum_before(ws, first_start)
-    log.info("baseline sum before window: %.2f gal", baseline)
+def _import(ws, stat_id, name, unit, points):
+    """points = [(tz-aware hour-aligned datetime, value)] ascending. Builds a
+    cumulative sum continuing from whatever HA already has before the window."""
+    first_start = points[0][0].isoformat()
+    baseline = last_sum_before(ws, stat_id, first_start)
     stats, running = [], baseline
-    for d, gal in daily:
-        running += gal
-        start = datetime.fromisoformat(d).replace(
-            hour=0, minute=0, second=0, microsecond=0, tzinfo=TZ)
+    for start, val in points:
+        running += val
         stats.append({"start": start.isoformat(), "state": running, "sum": running})
     r = ha_call(ws, {
         "type": "recorder/import_statistics",
-        "metadata": {
-            "has_mean": False, "has_sum": True, "name": STAT_NAME,
-            "source": STAT_SOURCE, "statistic_id": STAT_ID,
-            "unit_of_measurement": UNIT,
-        },
+        "metadata": {"has_mean": False, "has_sum": True, "name": name,
+                     "source": STAT_SOURCE, "statistic_id": stat_id,
+                     "unit_of_measurement": unit},
         "stats": stats,
     })
     if not r.get("success"):
-        raise RuntimeError(f"import_statistics failed: {r.get('error')}")
-    log.info("imported %d daily points (last sum=%.2f gal)", len(stats), running)
+        raise RuntimeError(f"import_statistics({stat_id}) failed: {r.get('error')}")
+    log.info("imported %d points into %s (last sum=%.2f, baseline=%.2f)",
+             len(stats), stat_id, running, baseline)
+
+
+def import_usage(ws, rows):
+    """rows = [(naive local datetime, gallons)] hourly, ascending."""
+    pts = [(dt.replace(minute=0, second=0, microsecond=0, tzinfo=TZ), g)
+           for dt, g in rows]
+    _import(ws, STAT_ID, STAT_NAME, UNIT, pts)
+
+
+def import_cost(ws, statements):
+    """statements newest-first; import each monthly bill amount as cumulative cost."""
+    pts = []
+    for s in sorted(statements, key=lambda x: x["bill_date"]):
+        start = datetime.fromisoformat(s["bill_date"]).replace(
+            hour=0, minute=0, second=0, microsecond=0, tzinfo=TZ)
+        pts.append((start, s["amount"]))
+    if pts:
+        _import(ws, STAT_COST_ID, STAT_COST_NAME, COST_UNIT, pts)
+
+
+# --------------------------------------------------------------------------- #
+# HA sensors (set via the Core REST API using the add-on's Supervisor token)
+# --------------------------------------------------------------------------- #
+def ha_set_state(entity_id, state, attributes):
+    token = os.environ.get("SUPERVISOR_TOKEN")
+    if not token:
+        log.warning("no SUPERVISOR_TOKEN; skipping sensor %s", entity_id)
+        return
+    body = json.dumps({"state": state, "attributes": attributes}).encode()
+    req = urllib.request.Request(
+        f"http://supervisor/core/api/states/{entity_id}", data=body, method="POST",
+        headers={"Authorization": f"Bearer {token}",
+                 "Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=20).read()
+        log.info("set %s = %s", entity_id, state)
+    except Exception as e:
+        log.warning("failed to set %s: %s", entity_id, e)
+
+
+def push_billing_sensors(account):
+    if account.get("balance_due") is not None:
+        ha_set_state("sensor.veolia_water_balance_due", account["balance_due"],
+                     {"unit_of_measurement": "USD", "device_class": "monetary",
+                      "friendly_name": "Veolia Water Balance Due", "icon": "mdi:cash"})
+    if account.get("due_date"):
+        ha_set_state("sensor.veolia_water_due_date", account["due_date"],
+                     {"device_class": "date",
+                      "friendly_name": "Veolia Water Due Date", "icon": "mdi:calendar-clock"})
+    if account.get("statements"):
+        s = account["statements"][0]
+        ha_set_state("sensor.veolia_water_last_bill", s["amount"],
+                     {"unit_of_measurement": "USD", "device_class": "monetary",
+                      "friendly_name": "Veolia Water Last Bill", "icon": "mdi:receipt",
+                      "bill_date": s["bill_date"], "service_start": s["service_start"],
+                      "service_end": s["service_end"]})
+
+
+def push_usage_sensor(rows):
+    """Latest hourly reading + recent-window attributes for leak automations."""
+    if not rows:
+        return
+    last_dt, last_gal = rows[-1]
+    last24 = rows[-24:]
+    overnight = [g for dt, g in rows[-30:] if 1 <= dt.hour <= 5]
+    ha_set_state("sensor.veolia_water_last_hour", round(last_gal, 2), {
+        "unit_of_measurement": "gal", "device_class": "water",
+        "state_class": "measurement", "friendly_name": "Veolia Water Last Hour",
+        "icon": "mdi:water",
+        "reading_time": last_dt.replace(tzinfo=TZ).isoformat(),
+        "last_24h_total_gal": round(sum(g for _, g in last24), 2),
+        "last_24h_gal": [round(g, 2) for _, g in last24],
+        "recent_overnight_min_gal": round(min(overnight), 2) if overnight else None,
+    })
 
 
 # --------------------------------------------------------------------------- #
@@ -432,45 +642,59 @@ def import_stats(ws, daily):
 def run_once(opts):
     require(opts, "veolia_username", "veolia_password", "account_number",
             "gmail_username", "gmail_app_password")
+    profile_dir = os.path.join(DATA_DIR, "chrome-profile")
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=[
-            "--no-sandbox", "--disable-dev-shm-usage",
-            "--disable-background-networking", "--disable-sync",
-            "--disable-features=Translate,OptimizationHints",
-        ])
-        ctx_kw = {"user_agent": UA, "locale": "en-US"}
-        if os.path.exists(STATE_PATH):
-            ctx_kw["storage_state"] = STATE_PATH
-        ctx = browser.new_context(**ctx_kw)
-        page = ctx.new_page()
+        # Persistent context (a real on-disk profile) keeps the Cloudflare
+        # clearance + login session across runs, and is far stealthier than a
+        # fresh context. Headed only — headless does not pass Turnstile.
+        ctx = p.chromium.launch_persistent_context(
+            profile_dir, headless=HEADLESS, no_viewport=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"])
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.set_default_timeout(45000)
         try:
-            goto(page, f"{PORTAL}/water-usage/{opts['account_number']}")
+            goto(page, f"{PORTAL}/account-summary")
             if not is_logged_in(page):
                 login(page, opts)
-                goto(page, f"{PORTAL}/water-usage/{opts['account_number']}")
-            ctx.storage_state(path=STATE_PATH)  # persist refreshed session
+                goto(page, f"{PORTAL}/account-summary")
 
-            csv_text = fetch_daily_csv(page, opts)
-            daily = parse_csv(csv_text)
-            if not daily:
+            account = scrape_account(page)
+            if not account["statements"]:
+                dump_page(page, "no-statements")
+                raise RuntimeError("no billing statements found on account summary")
+            latest = account["statements"][0]
+            window = (latest["service_start"], latest["service_end"])
+
+            rows = parse_rows(fetch_usage_csv(page, window, "HOURLY"))
+            if not rows:
                 raise RuntimeError("no usage rows parsed from CSV")
-            log.info("parsed %d days: %s ... %s",
-                     len(daily), daily[0], daily[-1])
+            daily = aggregate_daily(rows)
+            log.info("parsed %d hourly rows (%s .. %s); %d days",
+                     len(rows), rows[0][0], rows[-1][0], len(daily))
 
             if opts["dry_run"]:
-                log.info("DRY RUN: not writing to HA. Sample rows:")
-                for d, g in daily[-7:]:
-                    log.info("   %s  %.2f gal", d, g)
+                log.info("DRY RUN — not writing to HA.")
+                log.info("  balance due: $%s (due %s)",
+                         account["balance_due"], account["due_date"])
+                for s in account["statements"][:6]:
+                    log.info("  bill %s  %s..%s  $%.2f", s["bill_date"],
+                             s["service_start"], s["service_end"], s["amount"])
+                for d, g in daily[-5:]:
+                    log.info("  daily %s  %.2f gal", d, g)
+                for dt, g in rows[-6:]:
+                    log.info("  hourly %s  %.2f gal", dt, g)
                 return
+
             ws = ha_ws()
             try:
-                import_stats(ws, daily)
+                import_usage(ws, rows)
+                import_cost(ws, account["statements"])
             finally:
                 ws.close()
+            push_billing_sensors(account)
+            push_usage_sensor(rows)
         finally:
             ctx.close()
-            browser.close()
 
 
 def main():
@@ -485,17 +709,21 @@ def main():
         log.info("run_on_start=false; sleeping %ss before first run", interval)
         time.sleep(interval)
 
+    once = "--once" in sys.argv  # local testing: run a single cycle and exit
+    retries = 1 if once else 3
     while True:
         ok = False
-        for attempt in range(1, 4):
+        for attempt in range(1, retries + 1):
             try:
                 run_once(opts)
                 ok = True
                 break
             except Exception as e:
-                log.exception("run failed (attempt %d/3): %s", attempt, e)
-                if attempt < 3:
+                log.exception("run failed (attempt %d/%d): %s", attempt, retries, e)
+                if attempt < retries:
                     time.sleep(60)
+        if once:
+            sys.exit(0 if ok else 1)
         nap = interval if ok else min(3600, interval)  # retry sooner on failure
         log.info("sleeping %.1fh until next run", nap / 3600)
         time.sleep(nap)

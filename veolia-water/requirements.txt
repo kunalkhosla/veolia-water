@@ -1,2 +1,2 @@
-playwright==1.47.0
+patchright
 websocket-client==1.8.0

@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.0
+
+- **Cloudflare bypass:** switch from Playwright to **patchright** and run a
+  headed Chromium under **Xvfb** — plain Playwright (headless or headed, Chromium
+  or real Chrome) gets stuck on the portal's Turnstile; patchright headed clears
+  it in seconds. Uses a persistent profile (`/data/chrome-profile`) so the
+  Cloudflare clearance + login session survive across runs (login/OTP only on
+  expiry).
+- **Email-OTP login** via Gmail IMAP, with robust waits (waits for the post-OTP
+  page to settle instead of closing mid-load).
+- **Hourly usage** imported as `veolia:water_consumption` (finest resolution the
+  portal exposes; HA rolls it up to daily/monthly for the Energy dashboard).
+- **Monthly bill cost** imported as `veolia:water_cost` from the statement
+  history.
+- **Billing sensors:** `sensor.veolia_water_balance_due`,
+  `sensor.veolia_water_due_date`, `sensor.veolia_water_last_bill`.
+- **Leak helper:** `sensor.veolia_water_last_hour` (latest hourly gallons +
+  last-24h list + recent overnight-min) for leak-detection automations.
+- Service window now derived from the account-summary statement dates (the CSV
+  endpoint serves HTML for out-of-range requests).
+
 ## 0.1.2
 
 - Robust navigation: drop `networkidle` (the portal's analytics/New Relic sockets

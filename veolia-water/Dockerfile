@@ -1,6 +1,6 @@
-# Hardcoded Debian/glibc base (NOT the HA Alpine base): Alpine/musl has no pip
-# here and can't run Playwright's Chromium. Supervisor builds this Dockerfile
-# directly for a local add-on, so BUILD_FROM indirection isn't needed.
+# Debian/glibc base (NOT the HA Alpine base): Alpine/musl can't run Chromium and
+# has no pip here. patchright drives a stealth-patched Chromium that clears the
+# portal's Cloudflare Turnstile — but only headed, so we run it under Xvfb.
 FROM python:3.12-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 \
@@ -10,10 +10,14 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 COPY requirements.txt ./
-# Playwright pulls in Chromium + its OS deps (glibc base, so Chromium runs fine).
-RUN pip install --no-cache-dir -r requirements.txt \
-    && playwright install --with-deps chromium
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends xvfb \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir -r requirements.txt \
+    && patchright install --with-deps chromium
 
 COPY veolia_water.py ./
 
-CMD ["python3", "veolia_water.py"]
+# Headed Chromium needs a display; Xvfb provides a virtual one.
+CMD ["xvfb-run", "-a", "--server-args=-screen 0 1280x1024x24", \
+     "python3", "veolia_water.py"]
