@@ -551,16 +551,27 @@ def ha_call(ws, msg):
 
 
 def last_sum_before(ws, stat_id, start_iso):
+    """Cumulative sum of the bucket immediately BEFORE the import window.
+
+    Must be strictly before ``start_iso`` — otherwise a re-import of the same
+    window reads back its own first bucket (written by the previous run) as the
+    baseline, so the running sum ratchets up by the first period's value on every
+    run (double-counting). We query hourly (the importer is hourly, so buckets are
+    hour-aligned) and explicitly keep only buckets that START before the window.
+    """
+    start_dt = datetime.fromisoformat(start_iso)
     r = ha_call(ws, {
         "type": "recorder/statistics_during_period",
-        "start_time": (datetime.fromisoformat(start_iso)
-                       - timedelta(days=800)).isoformat(),
+        "start_time": (start_dt - timedelta(days=800)).isoformat(),
         "end_time": start_iso,
         "statistic_ids": [stat_id],
-        "period": "day",
+        "period": "hour",
     })
     pts = (r.get("result") or {}).get(stat_id) or []
-    return pts[-1].get("sum", 0.0) if pts else 0.0
+    prior = [p for p in pts
+             if datetime.fromisoformat(p["start"].replace("Z", "+00:00"))
+             < start_dt]
+    return prior[-1].get("sum", 0.0) if prior else 0.0
 
 
 def _import(ws, stat_id, name, unit, points):

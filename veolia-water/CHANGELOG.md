@@ -1,3 +1,11 @@
+## 0.2.4
+
+- Fix statistics double-counting: `last_sum_before()` was reading the import
+  window's own first bucket as the baseline (day-period boundary off-by-one),
+  so the cumulative sum (and the Energy water/cost totals) ratcheted up by the
+  first period's value on every hourly run. Now queries hourly and keeps only
+  buckets that start strictly before the window. Re-imports are idempotent.
+
 # Changelog
 
 ## 0.2.3
