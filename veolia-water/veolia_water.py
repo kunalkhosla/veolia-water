@@ -232,8 +232,11 @@ def fetch_otp(opts, since_dt, timeout=150):
             M = imaplib.IMAP4_SSL(IMAP_HOST)
             M.login(user, pw)
             M.select("INBOX")
-            # search recent; filter by date+sender in python (robust across providers)
-            since = since_dt.strftime("%d-%b-%Y")
+            # search recent; filter by date+sender in python (robust across providers).
+            # since_dt is UTC; IMAP SINCE is a date the server evaluates in the account's
+            # local tz, so near UTC midnight a UTC date can be a day ahead and exclude
+            # today's email. Widen by a day; the precise `when` check below handles accuracy.
+            since = (since_dt - timedelta(days=1)).strftime("%d-%b-%Y")
             typ, data = M.search(None, f'(SINCE "{since}")')
             ids = data[0].split() if data and data[0] else []
             for mid in reversed(ids[-25:]):
