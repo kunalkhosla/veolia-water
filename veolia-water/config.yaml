@@ -1,5 +1,5 @@
 name: Veolia Water → HA
-version: "0.2.4"
+version: "0.2.5"
 slug: veolia_water
 description: Scrapes Veolia (ex-SUEZ) NJ water usage and imports it into HA statistics.
 url: https://github.com/kunalkhosla/veolia-water

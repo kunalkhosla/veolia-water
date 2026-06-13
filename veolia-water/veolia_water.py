@@ -447,7 +447,16 @@ def fetch_usage_csv(page, window, granularity="HOURLY"):
     today = datetime.now(TZ).date()
     start = date.fromisoformat(window[0])
     bill_end = date.fromisoformat(window[1])
-    for end in (today, bill_end):
+    # The portal serves HTML for any end date beyond the available data (which lags
+    # ~1-2 days). Step the end date back from today to grab the freshest CSV instead
+    # of jumping straight to the bill end (which loses every day past the statement).
+    ends = []
+    d = today
+    while d > bill_end and (today - d).days <= 7:
+        ends.append(d)
+        d -= timedelta(days=1)
+    ends.append(bill_end)
+    for end in ends:
         if end < start:
             continue
         url = (f"/cp-vna-suez-water-usage/data/{start.isoformat()}/"
